@@ -250,3 +250,87 @@ class SnowflakeQueryClient:
                 }
         except Exception as error:
             raise RuntimeError(f"Failed to fetch rows as tuples: {error}")
+
+	def execute_dml_query(
+		self,
+		query: str,
+		database: str,
+		schema: str,
+		query_params: Optional[dict] = None
+	) -> dict:
+		"""
+		Executes a DML query (INSERT, UPDATE, DELETE) and returns query ID and affected row count.
+
+		Use this method when your query modifies data in a table and you want to know how many rows were impacted.
+
+		Args:
+			query (str): SQL DML query with optional %(key)s-style placeholders.
+			database (str): Target database to switch into.
+			schema (str): Target schema to switch into.
+			query_params (dict, optional): Parameters to bind in the query.
+
+		Returns:
+			dict: {
+				"query_id": str,
+				"rows_affected": int
+			}
+
+		Raises:
+			RuntimeError: If query execution fails.
+		"""
+		conn = self.get_active_connection()
+		try:
+			with conn.cursor() as cursor:
+				cursor.execute(f"USE DATABASE {database}")
+				cursor.execute(f"USE SCHEMA {schema}")
+				cursor.execute(query, query_params or {})
+				query_id = cursor.sfqid
+				rows_affected = cursor.rowcount
+				return {
+					"query_id": query_id,
+					"rows_affected": rows_affected
+				}
+		except Exception as error:
+			raise RuntimeError(f"Failed to execute DML query: {error}")
+
+	def execute_control_command(
+		self,
+		query: str,
+		database: str,
+		schema: str,
+		query_params: Optional[dict] = None
+	) -> dict:
+		"""
+		Executes control commands such as CALL, ALTER TASK/PROCEDURE without expecting row results.
+
+		Use this method to:
+		- Trigger stored procedures
+		- Resume, suspend, or alter Snowflake tasks
+		- Execute system control logic
+
+		Args:
+			query (str): SQL command with optional %(key)s-style placeholders.
+			database (str): Target database to switch into.
+			schema (str): Target schema to switch into.
+			query_params (dict, optional): Parameters to bind in the query.
+
+		Returns:
+			dict: {
+				"query_id": str
+			}
+
+		Raises:
+			RuntimeError: If query execution fails.
+		"""
+		conn = self.get_active_connection()
+		try:
+			with conn.cursor() as cursor:
+				cursor.execute(f"USE DATABASE {database}")
+				cursor.execute(f"USE SCHEMA {schema}")
+				cursor.execute(query, query_params or {})
+				query_id = cursor.sfqid
+				return {
+					"query_id": query_id
+				}
+		except Exception as error:
+			raise RuntimeError(f"Failed to execute control command: {error}")
