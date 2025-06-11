@@ -1,6 +1,7 @@
 from datetime import datetime
 from pipeline_logic_scripts.snowflake_funcs.snowflake_query_client import SnowflakeQueryClient
 from utils.log_utils import LogBlock
+from typing import Optional
 
 logger = LogBlock(logger_name="data_pipeline", max_depth=3)
 
@@ -343,6 +344,240 @@ def get_latest_record_by_status(
                 f"STATUS: FAILED\n"
                 f"ERROR: {error}\n"
                 f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+        raise
+
+def get_discontinuous_query_windows(
+    day: str,
+    pipeline_name: str,
+    index_name: str,
+    table_name: str,
+    database: str,
+    schema: str,
+    snowflake_client: SnowflakeQueryClient,
+    logger: LogBlock
+) -> dict:
+    """
+    Checks for non-continuous query windows in a Snowflake table for a specific day,
+    pipeline, and index. Uses SQL only (no row-by-row Python comparisons).
+
+    Args:
+        day (str): Date string (e.g., '2025-06-11').
+        pipeline_name (str): Name of the pipeline.
+        index_name (str): Name of the index.
+        table_name (str): Target Snowflake table.
+        database (str): Database name.
+        schema (str): Schema name.
+        snowflake_client (SnowflakeQueryClient): Connection client.
+        logger (LogBlock): Logging instance.
+
+    Returns:
+        dict: {
+            "query_id": str,
+            "is_continuous": bool,
+            "discontinuities": list[dict]
+        }
+    """
+    key = "CHECK_DISCONTINUOUS_QUERY_WINDOWS"
+
+    query = f"""
+        WITH ordered_windows AS (
+            SELECT
+                query_window_start_ts,
+                query_window_end_ts,
+                LAG(query_window_end_ts) OVER (
+                    ORDER BY query_window_start_ts
+                ) AS prev_end_ts
+            FROM {table_name}
+            WHERE DATE(query_window_start_ts) = %(day)s
+              AND pipeline_name = %(pipeline_name)s
+              AND index_name = %(index_name)s
+        )
+        SELECT
+            prev_end_ts AS missing_query_window_start_ts,
+            query_window_start_ts AS missing_query_window_end_ts
+        FROM ordered_windows
+        WHERE prev_end_ts IS NOT NULL
+          AND query_window_start_ts != prev_end_ts
+        ORDER BY missing_query_window_start_ts
+    """
+
+    logger.info(
+        key=key,
+        message=(
+            f"STATUS: STARTED\n"
+            f"FILTER: pipeline_status = 'N/A', pipeline_name = '{pipeline_name}', index_name = '{index_name}', day = '{day}'\n"
+            f"QUERY:\n{query.strip()}"
+        )
+    )
+
+    try:
+        result = snowflake_client.fetch_all_rows_as_dataframe(
+            query=query,
+            database=database,
+            schema=schema,
+            query_params={
+                "day": day,
+                "pipeline_name": pipeline_name,
+                "index_name": index_name
+            }
+        )
+
+        df = result["data"]
+        query_id = result["query_id"]
+
+        if df.empty:
+            logger.info(
+                key=key,
+                message=(
+                    f"STATUS: COMPLETED\n"
+                    f"QUERY ID: {query_id}\n"
+                    f"RESULT: Query windows are continuous\n"
+                    f"FILTER: pipeline_name = '{pipeline_name}', index_name = '{index_name}', day = '{day}'\n"
+                    f"QUERY:\n{query.strip()}"
+                )
+            )
+            return {
+                "query_id": query_id,
+                "is_continuous": True,
+                "discontinuities": []
+            }
+
+        gaps = [
+            {
+                "missing_query_window_start_ts": r["missing_query_window_start_ts"].isoformat()
+                if isinstance(r["missing_query_window_start_ts"], datetime) else r["missing_query_window_start_ts"],
+
+                "missing_query_window_end_ts": r["missing_query_window_end_ts"].isoformat()
+                if isinstance(r["missing_query_window_end_ts"], datetime) else r["missing_query_window_end_ts"]
+            }
+            for _, r in df.iterrows()
+        ]
+
+        logger.info(
+            key=key,
+            message=(
+                f"STATUS: COMPLETED\n"
+                f"QUERY ID: {query_id}\n"
+                f"DISCONTINUITIES FOUND: {len(gaps)}\n"
+                f"FILTER: pipeline_name = '{pipeline_name}', index_name = '{index_name}', day = '{day}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+
+        return {
+            "query_id": query_id,
+            "is_continuous": False,
+            "discontinuities": gaps
+        }
+
+    except Exception as error:
+        logger.error(
+            key=key,
+            message=(
+                f"STATUS: FAILED\n"
+                f"ERROR: {error}\n"
+                f"FILTER: pipeline_name = '{pipeline_name}', index_name = '{index_name}', day = '{day}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+        raise
+
+def find_overlapping_query_windows(
+    client: SnowflakeQueryClient,
+    database: str,
+    schema: str,
+    table_name: str,
+    pipeline_name: str,
+    index_name: str,
+    date_str: str,
+) -> dict:
+    """
+    Identifies overlapping query windows within a given day for a specific pipeline and index.
+
+    A query window is considered overlapping if its time range intersects with another record's window.
+    This function helps detect duplicate or conflicting processing ranges.
+
+    Args:
+        client (SnowflakeQueryClient): An active SnowflakeQueryClient instance.
+        database (str): Target Snowflake database name.
+        schema (str): Target schema name.
+        table_name (str): Name of the table to check.
+        pipeline_name (str): Value to filter `pipeline_name` column.
+        index_name (str): Value to filter `index_name` column.
+        date_str (str): Date in 'YYYY-MM-DD' format to define the day being checked.
+
+    Returns:
+        dict:
+            {
+                "query_id": str,
+                "data": pd.DataFrame of overlaps (may be empty),
+            }
+
+    Raises:
+        RuntimeError: If query execution fails.
+    """
+    logger = LogBlock(logger_name="data_pipeline", max_depth=6)
+    key = "FIND_OVERLAPPING_WINDOWS"
+
+    start_ts = f"{date_str} 00:00:00"
+    end_expr = f"DATEADD(day, 1, '{date_str}')"
+
+    logger.log_start(key=key, message=f"Checking overlaps for date: {date_str}")
+
+    query = f"""
+    WITH filtered_day_data AS (
+        SELECT *
+        FROM {table_name}
+        WHERE pipeline_name = %(pipeline_name)s
+          AND index_name = %(index_name)s
+          AND query_window_start_ts < {end_expr}
+          AND query_window_end_ts > '{start_ts}'
+    )
+    SELECT
+        t1.query_window_start_ts AS source_window_start_ts,
+        t1.query_window_end_ts AS source_window_end_ts,
+        t2.query_window_start_ts AS overlaps_with_start_ts,
+        t2.query_window_end_ts AS overlaps_with_end_ts
+    FROM filtered_day_data t1
+    INNER JOIN filtered_day_data t2
+      ON t1.query_window_start_ts < t2.query_window_end_ts
+     AND t1.query_window_end_ts > t2.query_window_start_ts
+     AND t1.query_window_start_ts != t2.query_window_start_ts
+    ORDER BY source_window_start_ts, overlaps_with_start_ts;
+    """
+
+    try:
+        result = client.fetch_all_rows_as_dataframe(
+            query=query,
+            database=database,
+            schema=schema,
+            query_params={
+                "pipeline_name": pipeline_name,
+                "index_name": index_name
+            }
+        )
+        df = result["data"]
+        logger.log_complete(
+            key=key,
+            message=(
+                f"STATUS: COMPLETED\n"
+                f"QUERY ID: {result['query_id']}\n"
+                f"RECORDS FOUND: {len(df)}\n"
+                f"FILTER: pipeline_name = '{pipeline_name}', index_name = '{index_name}', date = '{date_str}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+        return result
+    except Exception as e:
+        logger.log_failure(
+            key=key,
+            message=(
+                f"STATUS: FAILED\n"
+                f"FILTER: pipeline_name = '{pipeline_name}', index_name = '{index_name}', date = '{date_str}'\n"
+                f"ERROR: {str(e)}\n"
                 f"QUERY:\n{query.strip()}"
             )
         )
