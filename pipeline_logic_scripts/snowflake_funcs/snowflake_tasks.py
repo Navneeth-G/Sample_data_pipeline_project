@@ -1,3 +1,4 @@
+from datetime import datetime
 from pipeline_logic_scripts.snowflake_funcs.snowflake_query_client import SnowflakeQueryClient
 from utils.log_utils import LogBlock
 
@@ -132,6 +133,92 @@ def count_records_by_pipeline_status(
                 f"ERROR: {error}\n"
                 f"QUERY:\n{query}"
             )
+        )
+        raise
+
+
+def pick_oldest_pending_record(
+    table_name: str,
+    database: str,
+    schema: str,
+    snowflake_client: SnowflakeQueryClient,
+    logger: LogBlock
+) -> dict:
+    """
+    Fetches the oldest pending record based on query_window_start_ts from the table.
+    Datetime fields are converted to ISO 8601 strings for compatibility with JSON/Pendulum/etc.
+
+    Args:
+        table_name (str): Target table name.
+        database (str): Snowflake database name.
+        schema (str): Schema name.
+        snowflake_client (SnowflakeQueryClient): Shared Snowflake connection object.
+        logger (LogBlock): Logger instance for structured logs.
+
+    Returns:
+        dict: {
+            "query_id": str,
+            "record": dict or None
+        }
+
+    Raises:
+        RuntimeError: On query failure.
+    """
+    key = "PICK_OLDEST_PENDING"
+    query = f"""
+        SELECT * FROM {table_name}
+        WHERE pipeline_status = 'pending'
+        ORDER BY query_window_start_ts ASC
+        LIMIT 1
+    """
+
+    logger.info(
+        key=key,
+        message=f"STATUS: STARTED\nQUERY:\n{query.strip()}"
+    )
+
+    try:
+        result = snowflake_client.fetch_all_rows_as_dataframe(
+            query=query,
+            database=database,
+            schema=schema
+        )
+
+        df = result["data"]
+        query_id = result["query_id"]
+
+        if df.empty:
+            logger.info(
+                key=key,
+                message=f"STATUS: COMPLETED\nQUERY ID: {query_id}\nRESULT: No pending records found\nQUERY:\n{query.strip()}"
+            )
+            return {"query_id": query_id, "record": None}
+
+        # Convert first row to dict and format datetime values
+        record_dict = {
+            col: val.isoformat() if isinstance(val, datetime) else val
+            for col, val in df.iloc[0].items()
+        }
+
+        logger.info(
+            key=key,
+            message=(
+                f"STATUS: COMPLETED\n"
+                f"QUERY ID: {query_id}\n"
+                f"RECORD PICKED:\n{record_dict}\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+
+        return {
+            "query_id": query_id,
+            "record": record_dict
+        }
+
+    except Exception as error:
+        logger.error(
+            key=key,
+            message=f"STATUS: FAILED\nERROR: {error}\nQUERY:\n{query.strip()}"
         )
         raise
 
