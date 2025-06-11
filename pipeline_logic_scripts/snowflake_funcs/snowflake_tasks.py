@@ -136,24 +136,27 @@ def count_records_by_pipeline_status(
         )
         raise
 
-
-def pick_oldest_pending_record(
+def get_oldest_record_by_status(
     table_name: str,
     database: str,
     schema: str,
+    pipeline_status: str,
     snowflake_client: SnowflakeQueryClient,
     logger: LogBlock
 ) -> dict:
     """
-    Fetches the oldest pending record based on query_window_start_ts from the table.
-    Datetime fields are converted to ISO 8601 strings for compatibility with JSON/Pendulum/etc.
+    Retrieves the oldest record (by query_window_start_ts) from a table
+    for a specific pipeline_status (e.g., 'pending', 'failed', 'in_progress').
+
+    Timestamp fields are converted to ISO 8601 strings for downstream compatibility.
 
     Args:
-        table_name (str): Target table name.
+        table_name (str): Name of the target table.
         database (str): Snowflake database name.
-        schema (str): Schema name.
-        snowflake_client (SnowflakeQueryClient): Shared Snowflake connection object.
-        logger (LogBlock): Logger instance for structured logs.
+        schema (str): Snowflake schema name.
+        pipeline_status (str): Must be one of 'pending', 'failed', 'in_progress'.
+        snowflake_client (SnowflakeQueryClient): Snowflake connection client.
+        logger (LogBlock): Structured logger instance.
 
     Returns:
         dict: {
@@ -162,26 +165,32 @@ def pick_oldest_pending_record(
         }
 
     Raises:
-        RuntimeError: On query failure.
+        RuntimeError: If the query fails.
     """
-    key = "PICK_OLDEST_PENDING"
+    status_key = pipeline_status.upper()
+    key = f"PICK_OLDEST_{status_key}"
     query = f"""
         SELECT * FROM {table_name}
-        WHERE pipeline_status = 'pending'
+        WHERE pipeline_status = %(pipeline_status)s
         ORDER BY query_window_start_ts ASC
         LIMIT 1
     """
 
     logger.info(
         key=key,
-        message=f"STATUS: STARTED\nQUERY:\n{query.strip()}"
+        message=(
+            f"STATUS: STARTED\n"
+            f"FILTER: pipeline_status = '{pipeline_status}'\n"
+            f"QUERY:\n{query.strip()}"
+        )
     )
 
     try:
         result = snowflake_client.fetch_all_rows_as_dataframe(
             query=query,
             database=database,
-            schema=schema
+            schema=schema,
+            query_params={"pipeline_status": pipeline_status}
         )
 
         df = result["data"]
@@ -190,11 +199,16 @@ def pick_oldest_pending_record(
         if df.empty:
             logger.info(
                 key=key,
-                message=f"STATUS: COMPLETED\nQUERY ID: {query_id}\nRESULT: No pending records found\nQUERY:\n{query.strip()}"
+                message=(
+                    f"STATUS: COMPLETED\n"
+                    f"QUERY ID: {query_id}\n"
+                    f"RESULT: No matching records\n"
+                    f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                    f"QUERY:\n{query.strip()}"
+                )
             )
             return {"query_id": query_id, "record": None}
 
-        # Convert first row to dict and format datetime values
         record_dict = {
             col: val.isoformat() if isinstance(val, datetime) else val
             for col, val in df.iloc[0].items()
@@ -206,6 +220,7 @@ def pick_oldest_pending_record(
                 f"STATUS: COMPLETED\n"
                 f"QUERY ID: {query_id}\n"
                 f"RECORD PICKED:\n{record_dict}\n"
+                f"FILTER: pipeline_status = '{pipeline_status}'\n"
                 f"QUERY:\n{query.strip()}"
             )
         )
@@ -218,10 +233,117 @@ def pick_oldest_pending_record(
     except Exception as error:
         logger.error(
             key=key,
-            message=f"STATUS: FAILED\nERROR: {error}\nQUERY:\n{query.strip()}"
+            message=(
+                f"STATUS: FAILED\n"
+                f"ERROR: {error}\n"
+                f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
         )
         raise
 
+def get_latest_record_by_status(
+    table_name: str,
+    database: str,
+    schema: str,
+    pipeline_status: str,
+    snowflake_client: SnowflakeQueryClient,
+    logger: LogBlock
+) -> dict:
+    """
+    Retrieves the latest record (by query_window_start_ts DESC)
+    from a table for a given pipeline_status.
 
+    Datetime fields are converted to ISO 8601 strings for compatibility.
 
+    Args:
+        table_name (str): Table to query.
+        database (str): Snowflake database name.
+        schema (str): Schema name.
+        pipeline_status (str): Filter value (e.g., 'completed', 'failed').
+        snowflake_client (SnowflakeQueryClient): Shared connection client.
+        logger (LogBlock): Logger instance.
 
+    Returns:
+        dict: {
+            "query_id": str,
+            "record": dict or None
+        }
+
+    Raises:
+        RuntimeError: On query failure.
+    """
+    status_key = pipeline_status.upper()
+    key = f"PICK_LATEST_{status_key}"
+    query = f"""
+        SELECT * FROM {table_name}
+        WHERE pipeline_status = %(pipeline_status)s
+        ORDER BY query_window_start_ts DESC
+        LIMIT 1
+    """
+
+    logger.info(
+        key=key,
+        message=(
+            f"STATUS: STARTED\n"
+            f"FILTER: pipeline_status = '{pipeline_status}'\n"
+            f"QUERY:\n{query.strip()}"
+        )
+    )
+
+    try:
+        result = snowflake_client.fetch_all_rows_as_dataframe(
+            query=query,
+            database=database,
+            schema=schema,
+            query_params={"pipeline_status": pipeline_status}
+        )
+
+        df = result["data"]
+        query_id = result["query_id"]
+
+        if df.empty:
+            logger.info(
+                key=key,
+                message=(
+                    f"STATUS: COMPLETED\n"
+                    f"QUERY ID: {query_id}\n"
+                    f"RESULT: No matching records\n"
+                    f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                    f"QUERY:\n{query.strip()}"
+                )
+            )
+            return {"query_id": query_id, "record": None}
+
+        record_dict = {
+            col: val.isoformat() if isinstance(val, datetime) else val
+            for col, val in df.iloc[0].items()
+        }
+
+        logger.info(
+            key=key,
+            message=(
+                f"STATUS: COMPLETED\n"
+                f"QUERY ID: {query_id}\n"
+                f"RECORD PICKED:\n{record_dict}\n"
+                f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+
+        return {
+            "query_id": query_id,
+            "record": record_dict
+        }
+
+    except Exception as error:
+        logger.error(
+            key=key,
+            message=(
+                f"STATUS: FAILED\n"
+                f"ERROR: {error}\n"
+                f"FILTER: pipeline_status = '{pipeline_status}'\n"
+                f"QUERY:\n{query.strip()}"
+            )
+        )
+        raise
